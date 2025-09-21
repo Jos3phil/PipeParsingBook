@@ -1,0 +1,12 @@
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+#archivos pdf
+*.pdf
+#carpeta Data
+Data/
+*.txt
+/__pycache__/
