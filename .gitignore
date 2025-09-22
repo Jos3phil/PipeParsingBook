@@ -1,4 +1,5 @@
 
+
 # Entornos virtuales
 .venv/
 venv/
@@ -10,3 +11,6 @@ env/
 Data/
 *.txt
 /__pycache__/
+data/
+*.json
+*.ipynb

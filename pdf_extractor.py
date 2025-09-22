@@ -89,6 +89,100 @@ def remove_known_header_lines(text: str) -> str:
     return "\n".join(lines[i:]).lstrip("\n")
 
 
+def _dehyphenate(text: str) -> str:
+    """Une palabras cortadas por salto de línea con guion duro o blando.
+    Regla básica: "palabra-\ncontinuacion" -> "palabracontinuacion" si la continuación inicia en minúscula o acentuada.
+    También elimina guiones suaves (\xad) al final de línea.
+    """
+    if not text:
+        return text
+    # quitar guion suave (soft hyphen) antes de saltos de línea
+    text = re.sub(r"\xad\n", "\n", text)
+    # casos como "palabra-\ncontinuacion" => "palabracontinuacion"
+    # incluye letras acentuadas y ñ
+    continuation = "a-záéíóúñäëïöüàèìòùç"  # minúsculas comunes en español
+    pattern = re.compile(rf"([A-Za-zÁÉÍÓÚÑÄËÏÖÜÀÈÌÒÙÇ]+)-\n([{continuation}])")
+    # aplicar repetidamente hasta que no haya más coincidencias
+    prev = None
+    while prev != text:
+        prev = text
+        text = pattern.sub(r"\1\2", text)
+    return text
+
+
+# === Auto detección del rectángulo de contenido por página ===
+# Usa los bloques de texto reales para delimitar dinámicamente el contenido y evitar
+# recortes superiores/inferiores que corten palabras.
+
+def _get_text_blocks(page: "fitz.Page") -> list[tuple]:
+    """Devuelve bloques de texto (x0, y0, x1, y1, text, ...)."""
+    try:
+        return page.get_text("blocks") or []
+    except Exception:
+        return []
+
+def _is_header_footer_block(text: str) -> bool:
+    """Heurística para identificar bloques que son encabezado/pie conocidos o números de página."""
+    if not text:
+        return False
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return False
+    def is_page_num(s: str) -> bool:
+        return bool(re.fullmatch(r"\d{1,4}", s))
+    for ln in lines:
+        if any(rx.match(ln) for rx in _HEADER_REGEXES):
+            continue
+        if is_page_num(ln):
+            continue
+        return False
+    return True
+
+def _auto_content_rect(page: "fitz.Page", margin_pt: float, pad_top_pt: float, pad_bottom_pt: float) -> "fitz.Rect":
+    """Detecta dinámicamente el rectángulo de contenido a partir de los bloques de texto.
+    Aplica padding superior/inferior y respeta un margen horizontal mínimo.
+    """
+    page_rect = page.rect
+    blocks = _get_text_blocks(page)
+
+    candidates: list[tuple[float, float, float, float]] = []
+    for b in blocks:
+        if len(b) < 5:
+            continue
+        x0, y0, x1, y1, txt = b[:5]
+        if not (isinstance(txt, str) and txt.strip()):
+            continue
+        if _is_header_footer_block(txt):
+            continue
+        # descartar bloques extremadamente pequeños (ruido)
+        if (x1 - x0) < 2 or (y1 - y0) < 2:
+            continue
+        candidates.append((x0, y0, x1, y1))
+
+    if not candidates:
+        # fallback: usar márgenes uniformes
+        x0 = margin_pt
+        x1 = page_rect.width - margin_pt
+        y0 = margin_pt
+        y1 = page_rect.height - margin_pt
+        return fitz.Rect(x0, y0, x1, y1)
+
+    min_x = min(x0 for x0, _, _, _ in candidates)
+    max_x = max(x1 for _, _, x1, _ in candidates)
+    min_y = min(y0 for _, y0, _, _ in candidates)
+    max_y = max(y1 for _, _, _, y1 in candidates)
+
+    # Ampliar con padding y limitar por los márgenes horizontales
+    x0 = max(margin_pt, min_x - 2)
+    x1 = min(page_rect.width - margin_pt, max_x + 2)
+    y0 = max(margin_pt, min_y - pad_top_pt)
+    y1 = min(page_rect.height - margin_pt, max_y + pad_bottom_pt)
+
+    if x1 <= x0 or y1 <= y0:
+        return page_rect
+    return fitz.Rect(x0, y0, x1, y1)
+
+
 def extract_pdf_to_text(
     input_pdf: Path,
     output_txt: Path,
@@ -101,9 +195,22 @@ def extract_pdf_to_text(
     special_header_pages: set[int] | None = None,
     special_header_cm: float | None = None,
     remove_header_lines: bool = False,
+    # Auto detección del rectángulo de contenido
+    auto_detect_content_rect: bool = False,
+    auto_rect_pad_top_cm: float = 0.2,
+    auto_rect_pad_bottom_cm: float = 0.2,
+    # Nuevas mejoras
+    dehyphenate_lines: bool = False,
+    debug_export_content_rects: Path | None = None,
+    # Rango de páginas y columnas genéricas
+    start_page: int | None = None,
+    end_page: int | None = None,
+    cols_start_page: int | None = None,
+    cols_after_start: int = 3,
+    col_overlap_cm: float = 0.0,
 ) -> None:
     """
-    Extrae texto desde un PDF, preservando estructura básica y, desde una página dada, en 3 columnas.
+    Extrae texto desde un PDF, preservando estructura básica y, desde una página dada, en N columnas.
 
     Parámetros:
     - input_pdf: ruta al PDF de entrada.
@@ -111,11 +218,19 @@ def extract_pdf_to_text(
     - margin_cm: margen a recortar en todos los lados (cm).
     - header_cm: banda superior adicional a recortar como encabezado (cm).
     - footer_cm: banda inferior adicional a recortar como pie (cm).
-    - three_cols_start_page: número de página (1-based) a partir del cual el contenido está en 3 columnas.
+    - three_cols_start_page: [DEPRECATED] página (1-based) para pasar a 3 columnas (para compatibilidad).
     - preserve_spaces_until_page: si se indica, preserva espacios en blanco tal cual hasta esa página (1-based).
     - special_header_pages: set de páginas (1-based) que usan un encabezado especial con altura special_header_cm.
     - special_header_cm: altura (cm) del encabezado especial para páginas en special_header_pages.
-    - remove_header_lines: si es True, intenta eliminar líneas de encabezado conocidas al inicio del texto de cada página.
+    - remove_header_lines: elimina líneas de encabezado conocidas al inicio del texto de cada página.
+    - auto_detect_content_rect: detecta dinámicamente el rectángulo de contenido por página.
+    - auto_rect_pad_top_cm / auto_rect_pad_bottom_cm: padding extra (cm) aplicado arriba/abajo al rect detectado.
+    - dehyphenate_lines: une palabras separadas por guion al final de línea.
+    - debug_export_content_rects: si se indica una ruta, exporta CSV con rectángulos de contenido por página.
+    - start_page / end_page: rango (1-based, inclusivo) de páginas a procesar.
+    - cols_start_page: página (1-based) a partir de la cual usar 'cols_after_start' columnas. Si None, usa 'three_cols_start_page'.
+    - cols_after_start: número de columnas a usar a partir de 'cols_start_page' (por defecto 3).
+    - col_overlap_cm: solape horizontal (cm) entre columnas para evitar cortes en los bordes (por defecto 0.0).
     """
     input_pdf = Path(input_pdf)
     output_txt = Path(output_txt)
@@ -128,16 +243,34 @@ def extract_pdf_to_text(
     base_header_pt = cm_to_pt(header_cm)
     footer_pt = cm_to_pt(footer_cm)
     special_header_pt = cm_to_pt(special_header_cm) if special_header_cm is not None else None
-
-    three_cols_start_idx = max(0, three_cols_start_page - 1)  # convertir a índice 0-based
+    pad_top_pt = cm_to_pt(auto_rect_pad_top_cm)
+    pad_bottom_pt = cm_to_pt(auto_rect_pad_bottom_cm)
+    col_overlap_pt = cm_to_pt(col_overlap_cm)
 
     doc = fitz.open(input_pdf)
     try:
+        page_count = doc.page_count
+        # Rango de páginas efectivo (1-based)
+        eff_start_page = max(1, start_page) if start_page else 1
+        eff_end_page = min(page_count, end_page) if end_page else page_count
+        if eff_start_page > eff_end_page:
+            raise ValueError("start_page > end_page")
+
+        # Índice para columnas (0-based)
+        effective_cols_start_page = cols_start_page if cols_start_page is not None else three_cols_start_page
+        cols_start_idx = max(0, (effective_cols_start_page or 1) - 1)
+
         all_pages_text: list[str] = []
-        for page_idx in range(doc.page_count):
+        rect_rows: list[str] = []
+        if debug_export_content_rects is not None:
+            rect_rows.append("page_no,x0,y0,x1,y1")
+        for page_idx in range(page_count):
+            page_no = page_idx + 1
+            if page_no < eff_start_page or page_no > eff_end_page:
+                continue
+
             page = doc.load_page(page_idx)
             width, height = page.rect.width, page.rect.height
-            page_no = page_idx + 1  # 1-based
 
             # Escoger altura de encabezado dinámica por página
             header_pt_this_page = base_header_pt
@@ -145,38 +278,56 @@ def extract_pdf_to_text(
                 header_pt_this_page = special_header_pt
 
             # Área de contenido (recorta márgenes y bandas de encabezado/pie)
-            x0 = margin_pt
-            y0 = margin_pt + header_pt_this_page
-            x1 = width - margin_pt
-            y1 = height - margin_pt - footer_pt
-            content_rect = fitz.Rect(x0, y0, x1, y1)
+            if auto_detect_content_rect:
+                content_rect = _auto_content_rect(page, margin_pt, pad_top_pt, pad_bottom_pt)
+            else:
+                x0 = margin_pt
+                y0 = margin_pt + header_pt_this_page
+                x1 = width - margin_pt
+                y1 = height - margin_pt - footer_pt
+                content_rect = fitz.Rect(x0, y0, x1, y1)
+
+            if debug_export_content_rects is not None:
+                rect_rows.append(f"{page_no},{content_rect.x0:.2f},{content_rect.y0:.2f},{content_rect.x1:.2f},{content_rect.y1:.2f}")
 
             if content_rect.width <= 0 or content_rect.height <= 0:
-                # Si los parámetros dejan un área inválida, extraer toda la página como fallback
+                # fallback: extraer toda la página
                 page_text = page.get_text("text") or ""
                 if remove_header_lines:
                     page_text = remove_known_header_lines(page_text)
+                if dehyphenate_lines and page_text:
+                    page_text = _dehyphenate(page_text)
                 all_pages_text.append(page_text.strip())
                 continue
 
             preserve_ws = (preserve_spaces_until_page is not None) and (page_no <= preserve_spaces_until_page)
 
-            if page_idx >= three_cols_start_idx:
-                # Dividir en 3 columnas iguales dentro del área de contenido
-                col_w = content_rect.width / 3.0
-                col1 = fitz.Rect(content_rect.x0, content_rect.y0, content_rect.x0 + col_w, content_rect.y1)
-                col2 = fitz.Rect(content_rect.x0 + col_w, content_rect.y0, content_rect.x0 + 2 * col_w, content_rect.y1)
-                col3 = fitz.Rect(content_rect.x0 + 2 * col_w, content_rect.y0, content_rect.x1, content_rect.y1)
-
-                t1 = extract_page_text_by_clip(page, col1, preserve_ws=preserve_ws).rstrip()
-                t2 = extract_page_text_by_clip(page, col2, preserve_ws=preserve_ws).rstrip()
-                t3 = extract_page_text_by_clip(page, col3, preserve_ws=preserve_ws).rstrip()
-
-                # Unir columnas en orden de lectura: izquierda -> derecha
-                page_text = "\n\n".join([t1, t2, t3]).strip()
-            else:
-                # Páginas iniciales: extraer como una sola columna (texto corrido)
+            # Determinar número de columnas para esta página
+            num_cols = cols_after_start if page_idx >= cols_start_idx else 1
+            if num_cols <= 1:
                 page_text = extract_page_text_by_clip(page, content_rect, preserve_ws=preserve_ws).strip()
+                if dehyphenate_lines:
+                    page_text = _dehyphenate(page_text)
+            else:
+                col_w = content_rect.width / float(num_cols)
+                cols_text: list[str] = []
+                for i in range(num_cols):
+                    left = content_rect.x0 + i * col_w
+                    right = content_rect.x0 + (i + 1) * col_w
+                    # aplicar solape
+                    if i > 0:
+                        left -= col_overlap_pt / 2.0
+                    if i < num_cols - 1:
+                        right += col_overlap_pt / 2.0
+                    # clamp
+                    left = max(content_rect.x0, left)
+                    right = min(content_rect.x1, right)
+                    col_rect = fitz.Rect(left, content_rect.y0, right, content_rect.y1)
+                    t = extract_page_text_by_clip(page, col_rect, preserve_ws=preserve_ws).rstrip()
+                    if dehyphenate_lines:
+                        t = _dehyphenate(t)
+                    cols_text.append(t)
+                page_text = "\n\n".join(cols_text).strip()
 
             if remove_header_lines and page_text:
                 page_text = remove_known_header_lines(page_text)
@@ -186,6 +337,9 @@ def extract_pdf_to_text(
         # Separar páginas con dos saltos de línea
         final_text = "\n\n".join(all_pages_text).rstrip() + "\n"
         output_txt.write_text(final_text, encoding="utf-8")
+
+        if debug_export_content_rects is not None and rect_rows:
+            Path(debug_export_content_rects).write_text("\n".join(rect_rows) + "\n", encoding="utf-8")
 
     finally:
         doc.close()
@@ -202,7 +356,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--three-cols-start-page",
         type=int,
         default=13,
-        help="Página (1-based) desde la cual el PDF está en 3 columnas (por defecto 13)",
+        help="[DEPRECATED] Página (1-based) desde la cual el PDF está en 3 columnas (por defecto 13)",
     )
     # Nuevos flags
     p.add_argument(
@@ -227,6 +381,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Si se indica, elimina líneas típicas de encabezado detectadas al inicio del texto de la página",
     )
+    # Auto content rect flags
+    p.add_argument(
+        "--auto-detect-content-rect",
+        action="store_true",
+        help="Detecta automáticamente el rectángulo de contenido por página usando bloques de texto",
+    )
+    p.add_argument(
+        "--auto-rect-pad-top-cm",
+        type=float,
+        default=0.2,
+        help="Padding superior (cm) añadido al rectángulo detectado automáticamente (por defecto 0.2)",
+    )
+    p.add_argument(
+        "--auto-rect-pad-bottom-cm",
+        type=float,
+        default=0.2,
+        help="Padding inferior (cm) añadido al rectángulo detectado automáticamente (por defecto 0.2)",
+    )
+    p.add_argument(
+        "--dehyphenate-lines",
+        action="store_true",
+        help="Une palabras separadas por guion al final de línea",
+    )
+    p.add_argument(
+        "--debug-export-content-rects",
+        default=None,
+        help="Ruta de salida (CSV) para exportar los rectángulos de contenido usados por página",
+    )
+    # Rango de páginas y columnas
+    p.add_argument("--start-page", type=int, default=None, help="Página inicial (1-based) a procesar")
+    p.add_argument("--end-page", type=int, default=None, help="Página final (1-based) a procesar")
+    p.add_argument("--cols-start-page", type=int, default=None, help="Página (1-based) a partir de la cual usar N columnas")
+    p.add_argument("--cols-after-start", type=int, default=3, help="Número de columnas a partir de --cols-start-page (por defecto 3)")
+    p.add_argument("--col-overlap-cm", type=float, default=0.0, help="Solape horizontal (cm) entre columnas (por defecto 0.0)")
     return p
 
 
@@ -244,8 +432,20 @@ def main(argv: list[str] | None = None) -> int:
             special_header_pages=parse_pages_csv(args.special_header_pages),
             special_header_cm=args.special_header_cm,
             remove_header_lines=args.remove_header_lines,
+            auto_detect_content_rect=args.auto_detect_content_rect,
+            auto_rect_pad_top_cm=args.auto_rect_pad_top_cm,
+            auto_rect_pad_bottom_cm=args.auto_rect_pad_bottom_cm,
+            dehyphenate_lines=args.dehyphenate_lines,
+            debug_export_content_rects=Path(args.debug_export_content_rects) if args.debug_export_content_rects else None,
+            start_page=args.start_page,
+            end_page=args.end_page,
+            cols_start_page=args.cols_start_page,
+            cols_after_start=args.cols_after_start,
+            col_overlap_cm=args.col_overlap_cm,
         )
         print(f"[OK] Texto extraído en: {args.output}")
+        if args.debug_export_content_rects:
+            print(f"[OK] Rectángulos exportados en: {args.debug_export_content_rects}")
         return 0
     except Exception as e:
         print(f"[ERROR] {e}", file=sys.stderr)
