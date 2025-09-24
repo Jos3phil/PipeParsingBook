@@ -14,3 +14,7 @@ Data/
 data/
 *.json
 *.ipynb
+normalizar_diccionario.py
+parser_*.py
+normalizador_*.py 
+!normalizador_simple.py
