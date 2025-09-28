@@ -18,4 +18,8 @@ normalizar_diccionario.py
 parser_*.py
 normalizador_*.py 
 !normalizador_simple.py
+dividir_diccionario_fijo.py
+extractor_lemas_completo.py
 vscode.deb
+*.md
+!README.md

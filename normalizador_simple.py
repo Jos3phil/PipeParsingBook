@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import re
 
 def es_inicio_lema(linea):

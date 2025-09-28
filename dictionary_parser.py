@@ -1,4 +1,106 @@
 #!/usr/bin/env python3
+'''
+Parser de diccionarios marcados a JSON estructurado.
+
+Resumen
+-------
+Este módulo proporciona la clase DictionaryParser y una interfaz CLI para convertir
+archivos de diccionario marcados (con bloques entre <begin> ... <end>) en una lista
+de entradas JSON estructuradas. Está diseñado para procesar tanto diccionarios
+quechua-español como español-quechua, detectando el tipo por el nombre del archivo.
+
+Principales responsabilidades
+-----------------------------
+- Leer y validar un archivo de abreviaciones JSON (por defecto "abbreviations.json")
+    que debe contener tres entradas opcionales: 'countries', 'peru_regions' y
+    'abbreviations'.
+- Extraer bloques de entrada delimitados por <begin> y <end>.
+- Parsear cada entrada para extraer campos estructurados:
+        - lema
+        - categoria_gramatical
+        - campo_semantico
+        - definicion
+        - variantes_dialectales (mapa abrev_canónica -> valor)
+        - sinonimos (lista)
+        - ejemplos (lista)
+- Normalizar y mapear etiquetas de países/regiones a abreviaturas canónicas usando
+    múltiples alias (con/sin punto, con ':', alias cortos, nombres completos).
+- Manejar variantes dialectales encadenadas tipo "Pe.Aya:Anc:Caj: valor".
+- Soportar detección y tratamiento de marca de neologismo "NEOL.".
+- Exportar la salida en JSON y devolver la lista de entradas parseadas.
+
+Formato esperado de abbreviations.json
+-------------------------------------
+Objeto JSON con (opcional) las claves:
+- "countries": { "Arg.": "Argentina", "Pe.": "Perú", ... }
+- "peru_regions": { "Pe.Aya.": "Ayacucho", "Pe.Caj.": "Cajamarca", ... }
+- "abbreviations": { "s.": "sustantivo", "v.": "verbo", "adj.": "adjetivo", ... }
+
+Principales métodos de DictionaryParser
+---------------------------------------
+- __init__(abbreviations_path="abbreviations.json")
+        Carga abreviaciones y construye alias, expresiones regulares y conjuntos auxiliares.
+
+- parse_file(input_path, output_path=None) -> List[Dict[str, Any]]
+        Lee el archivo, extrae entradas, parsea cada una y opcionalmente escribe JSON.
+        Devuelve la lista de entradas parseadas.
+
+- parse_entry(entry_text) -> Dict[str, Any]
+        Parsea una única entrada y devuelve el diccionario con las claves descritas arriba.
+
+- extract_entries(content) -> List[str]
+        Divide el contenido por marcadores <begin>/<end> y devuelve bloques de entrada.
+
+- determine_dictionary_type(filename) -> str
+        Heurística simple basada en el nombre del archivo:
+        'marcadore.txt' -> 'quechua_espanol', 'marcadores.txt' -> 'espanol_quechua', else 'unknown'.
+
+Notas de parseo y normalización
+--------------------------------
+- Las categorías gramaticales reconocidas por defecto (canónicas) incluyen: s., v., adj.,
+    adv., interj., alfab. (se obtienen de 'abbreviations' y se filtran por un conjunto canónico).
+- Se consideran etiquetas morfológicas no semánticas (p. ej. 'm.', 'f.', 'pl.', 'imper.').
+- La detección de abreviaturas es tolerante a la presencia/ausencia del punto final y a
+    delimitadores comunes (espacios, paréntesis, comas, dos puntos).
+- Las variantes dialectales se aceptan en forma encadenada y se normalizan a abreviaturas
+    canónicas cuando es posible; si no, se conservan tal cual.
+- Se extraen SINÓNIMOS (prefijos tipo "SINÓN:" / "SINON:"), EJEMPLOS (prefijo "EJEM:")
+    y VARIEDADES (si aparecen) con heurísticas de separación por delimitadores comunes.
+- Se normalizan separadores de acepciones '||' preservando su significado como separador.
+- Se intenta eliminar referencias del tipo "V. ..." y se ajustan espacios/puntuación.
+
+Limitaciones y advertencias
+---------------------------
+- La calidad del parseo depende de la coherencia del archivo de entrada y del contenido
+    de abbreviations.json. Si dicho archivo falta, el parser avisa y procede con mapas vacíos,
+    lo que puede reducir la normalización de etiquetas de países/regiones.
+- Se han tomado decisiones conservadoras para evitar falsos positivos (por ejemplo,
+    no se indexan nombres de países completos en la unión de etiquetas para reducir
+    coincidencias accidentales como "Perú: ...").
+- Algunas construcciones muy heterogéneas o entradas altamente libres pueden no
+    ser parseadas perfectamente y requerir revisión manual.
+- La heurística para extraer el lema toma la primera secuencia de letras (incluyendo
+    caracteres acentuados y 'ñ') y un posible signo de exclamación final.
+
+Interfaz de línea de comandos
+-----------------------------
+python dictionary_parser.py input_file [--output|-o OUTPUT] [--abbreviations|-a ABBREVIATIONS]
+- input_file: archivo marcado de entrada (p. ej. marcadore.txt o marcadores.txt)
+- --output / -o: archivo JSON de salida (si no se provee, se elige por heurística)
+- --abbreviations / -a: ruta al archivo de abreviaciones JSON (default: abbreviations.json)
+
+Ejemplo de salida por entrada (estructura de diccionario)
+----------------------------------------------------------
+{
+    "lema": "...",
+
+    "categoria_gramatical": "s." | "null",
+    "campo_semantico": "Arg." | "null" | "NEOL.",
+    "definicion": "...",
+    "variantes_dialectales": { "Pe.Aya.": "valor regional", "Arg.": "valor" },
+    "sinonimos": ["sin1", "sin2"],
+    "ejemplos": ["Ejemplo 1", "Ejemplo 2"]
+'''
 """
 Parser para generar diccionarios estructurados en JSON a partir de archivos marcados.
 Procesa tanto quechua-español como español-quechua y genera JSONs estructurados.
